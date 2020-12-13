@@ -6,9 +6,11 @@ and
 https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#string_and_bytes_literals
 """
 
-from ..parser import (BaseSegment, NamedSegment, OneOf, Ref, Sequence, Bracketed, Delimited, AnyNumberOf)
-
-from .dialect_ansi import ansi_dialect
+from ..parser import (BaseSegment, ReSegment, NamedSegment, OneOf, Ref, Sequence, Bracketed, Delimited, AnyNumberOf, GreedyUntil, StartsWith, Indent, Dedent, KeywordSegment, Not, Anything)
+from .dialect_ansi import (
+    ansi_dialect,
+    SelectTargetElementSegment as AnsiSelectTargetElementSegment,
+)
 
 
 bigquery_dialect = ansi_dialect.copy_as('bigquery')
@@ -26,7 +28,8 @@ bigquery_dialect.patch_lexer_struct([
 ])
 
 bigquery_dialect.add(
-    DoubleQuotedLiteralSegment=NamedSegment.make('double_quote', name='quoted_literal', type='literal', trim_chars=('"',))
+    DoubleQuotedLiteralSegment=NamedSegment.make('double_quote', name='quoted_literal', type='literal', trim_chars=('"',)),
+    StructKeywordSegment=KeywordSegment.make('struct', name="struct"),
 )
 
 # Add the microsecond unit
@@ -58,6 +61,147 @@ class IntervalExpressionSegment(BaseSegment):
     )
 
 
+@bigquery_dialect.segment()
+class ExceptSegment(BaseSegment):
+    """select * except(column_a, column_b, column_c).
+
+    https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#select_except
+    """
+    type = 'except'
+    match_grammar = Sequence(
+        'EXCEPT',
+        Ref('IdentifierListSegment')
+    )
+
+
+@bigquery_dialect.segment()
+class ReplaceSegment(BaseSegment):
+    """select * replace ("widget" as item_name).
+
+    https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#select_replace"""
+    type = "replace"
+
+    match_grammar = Sequence(
+        'REPLACE',
+        OneOf(
+            # Multiple replace in brackets
+            Bracketed(
+                Delimited(
+                    # Not *really* a select target element. It behaves exactly
+                    # the same way however.
+                    Ref('SelectTargetElementSegment'),
+                    delimiter=Ref('CommaSegment')
+                )
+            ),
+            # Single replace not in brackets.
+            Ref('SelectTargetElementSegment')
+        ),
+        optional=True
+    )
+
+
+@bigquery_dialect.segment()
+class StarModifierSegment(BaseSegment):
+    """A function that can be "applied" to the star selector.
+
+    For example: select * replace ... or select * except ..."""
+    match_grammar = Sequence(
+        Ref('ExceptSegment', optional=True),
+        Ref('ReplaceSegment', optional=True),
+    )
+
+class WildcardSelectTargetElementGrammar(BaseSegment):
+    """Matches wildcard selectors (*, a.*) and modifiers (e.g. b.* except ...)."""
+    match_grammar = Sequence(
+        Sequence(
+            Sequence(
+                Ref('SingleIdentifierGrammar'),
+                Ref('DotSegment'),
+                optional=True,
+            ),
+            Ref('StarSegment')
+        ),
+        Ref('StarModifierSegment', optional=True),
+        code_only=True
+    )
+
+
+@bigquery_dialect.segment()
+class StructSegment(BaseSegment):
+    """Container of ordered fields each with a type (required) and field name (optional).
+
+    https://cloud.google.com/bigquery/docs/reference/standard-sql/data-types#constructing_a_struct"""
+    type = 'struct'
+    match_grammar = Sequence(
+        'STRUCT',
+        Bracketed(
+            Delimited(
+                AnyNumberOf(
+                    Sequence(
+                        OneOf(
+                            Ref('LiteralGrammar'),
+                            Ref('FunctionSegment'),
+                            Ref('IntervalExpressionSegment'),
+                            Ref('ObjectReferenceSegment'),
+                            Ref('ExpressionSegment')
+                        ),
+                        Ref('AliasExpressionSegment', optional=True)
+                    ),
+                ),
+                delimiter=Ref('CommaSegment'),
+            ),
+            optional=True
+        )
+    )
+
+
+class SelectTargetElementSegment(AnsiSelectTargetElementSegment):
+    """An element in the targets of a select statement."""
+    parse_grammar = OneOf(
+        # *, blah.*, blah.blah.*, etc.
+        Ref('WildcardSelectTargetElementGrammar'),
+        Sequence(
+            OneOf(
+                Ref('LiteralGrammar'),
+                Ref('StructSegment'),
+                Ref('FunctionSegment'),
+                Ref('IntervalExpressionSegment'),
+                Ref('ObjectReferenceSegment'),
+                Ref('ExpressionSegment'),
+            ),
+            Ref('AliasExpressionSegment', optional=True)
+        ),
+    )
+
+
+class SelectClauseSegment(BaseSegment):
+    """A group of elements in a select target statement."""
+    type = 'select_clause'
+    match_grammar = StartsWith(
+        'SELECT',
+        terminator=OneOf('FROM', 'LIMIT')
+    )
+
+    parse_grammar = Sequence(
+        'SELECT',
+        Ref('SelectClauseModifierSegment', optional=True),
+        Indent,
+        OneOf(
+            Sequence(
+                'AS',
+                'STRUCT',
+                Ref('StarSegment'),
+                Ref('StarModifierSegment', optional=True),
+            ),
+            Delimited(
+                Ref('SelectTargetElementSegment'),
+                delimiter=Ref('CommaSegment'),
+                allow_trailing=True
+            ),
+        ),
+        Dedent
+    )
+
 bigquery_dialect.replace(
     QuotedIdentifierSegment=NamedSegment.make('back_quote', name='quoted_identifier', type='identifier', trim_chars=('`',)),
     IntervalExpressionSegment=IntervalExpressionSegment,
@@ -79,46 +223,16 @@ bigquery_dialect.replace(
             optional=True
         )
     ),
-    WildcardSelectTargetElementGrammar=Sequence(
-        # *, blah.*, blah.blah.*, etc.
-        Sequence(
-            AnyNumberOf(
-                Sequence(
-                    Ref('SingleIdentifierGrammar'),
-                    Ref('DotSegment'),
-                    code_only=True
-                )
-            ),
-            Ref('StarSegment'), code_only=False
-        ),
-        # Optional EXCEPT or REPLACE clause
-        # https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#select_replace
-        Sequence(
-            'EXCEPT',
-            Bracketed(
-                Delimited(
-                    Ref('SingleIdentifierGrammar'),
-                    delimiter=Ref('CommaSegment')
-                )
-            ),
-            optional=True
-        ),
-        Sequence(
-            'REPLACE',
-            OneOf(
-                # Multiple replace in brackets
-                Bracketed(
-                    Delimited(
-                        # Not *really* a select target element. It behaves exactly
-                        # the same way however.
-                        Ref('SelectTargetElementSegment'),
-                        delimiter=Ref('CommaSegment')
-                    )
-                ),
-                # Single replace not in brackets.
-                Ref('SelectTargetElementSegment')
-            ),
-            optional=True
-        )
+    WildcardSelectTargetElementGrammar=WildcardSelectTargetElementGrammar,
+    SelectClauseSegment=SelectClauseSegment,
+    SelectTargetElementSegment=SelectTargetElementSegment,
+    FunctionNameSegment=ReSegment.make(
+        r"[A-Z][A-Z0-9_]*",
+        # struct has a special syntax
+        # so we deal with it in a
+        # separate segment
+        _anti_template=r"struct",
+        name='function_name',
+        type='function_name',
     ),
 )

@@ -5,6 +5,7 @@ import pytest
 from sqlfluff.rules.std import std_rule_set
 from sqlfluff.linter import Linter
 from sqlfluff.config import FluffConfig
+from utils import generate_test_segments
 
 
 def get_rule_from_set(code, config):
@@ -255,7 +256,7 @@ def test__rules__std_file(rule, path, violations):
     assert set(lnt.check_tuples()) == {(rule, v[0], v[1]) for v in violations}
 
 
-def test__rules__std_L003_process_raw_stack(generate_test_segments):
+def test__rules__std_L003_process_raw_stack():
     """Test the _process_raw_stack function.
 
     Note: This test probably needs expanding. It doesn't
